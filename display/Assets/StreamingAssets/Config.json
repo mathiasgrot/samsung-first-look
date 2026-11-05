@@ -1,0 +1,7 @@
+{
+    "targetFrameRate": 120,
+    "useVSync": false,
+    "useDebug": false,
+    "serverUrl": "ws://127.0.0.1:9980",
+    "ndiLatencyFrames": 0
+}
