@@ -1,227 +1,158 @@
 """
-MediaServerExt - state machine for the media_server COMP.
+MediaServerExt - owns the show. Unity follows what TD says.
+
+The nodes do the timing, this extension only decides what comes next and talks to Unity:
+  timer_trans    T_IN -> T_MID (loops) -> T_OUT, one segment per movie (table_trans).
+                 Its timer_frames is the index of t_in / t_mid / t_out, its segment picks switch_trans.
+  timer_content  plays active_a / active_b (index = timer_frames). Starts frameDelay frames
+                 (null_vars) after T_OUT and alerts T_IN's length before its end, so the return
+                 starts with the content's last frame under T_IN's last (fully opaque) frame.
+  constant_state base (switch_base), content (which of active_a / active_b plays) and length
+                 (timer_content), written here. Nodes read state from this CHOP, not from
+                 extension properties, so they always recook.
+  Movie lengths come from info CHOPs, read once (table_trans on init, length per run): a
+  live link would make the timers depend on the movies they drive (a cook loop).
 
 States
-  IDLE    idle loop playing
-  T_IN    transition in plays once  (transparent -> opaque)
-  T_MID   transition mid loops      (fully opaque) - base layer is swapped on entry
-  T_OUT   transition out plays once (opaque -> transparent)
-  ACTIVE  content video a|b plays once
-
-Flow
-  IDLE --play a|b--> T_IN -> T_MID (loops until release) --release--> T_OUT -> ACTIVE
-  ACTIVE --(video end - T_IN length)--> T_IN -> T_MID (loops until release) --release--> T_OUT -> IDLE
-         T_IN starts early so the video plays under it and its last frame lands
-         under T_IN's last (fully opaque) frame. Par Returntrim nudges this.
-  ACTIVE --stop--> the same return, started right away (a stop during T_OUT on the way
-         in is kept and starts the return as soon as ACTIVE is reached)
-  Both ways: a release that arrives during T_IN skips T_MID (T_IN -> T_OUT).
-  With no client connected nobody can release, so T_MID is skipped / ends after one cycle.
-  any state --cancel--> IDLE (hard cut, no transition)
+  IDLE -> T_IN -> T_MID (loops until Unity is ready) -> T_OUT -> ACTIVE
+  ACTIVE -> T_IN -> T_MID (loops until Unity is ready) -> T_OUT -> IDLE
+  Ready during T_IN skips T_MID. With no client connected T_MID plays once.
 
 Protocol (JSON over WebSocket, TD is the host)
-  -> {"cmd": "play", "video": "a"}   only accepted in IDLE
-  -> {"cmd": "stop"}                 return to IDLE with a transition (ACTIVE, or T_OUT going in)
-  -> {"cmd": "release"}              ends T_MID (accepted during T_IN or T_MID, both ways)
-  -> {"cmd": "cancel"}               hard cut to IDLE
-  -> {"cmd": "state"}                ask for current state
-  -> {"cmd": "config", "values": {"debug": true, ...}}
-                                     startup settings, sent by Unity on every connect.
-                                     Each key sets the media_server custom par of the same
-                                     name, capitalized (debug -> Debug, offsetx -> Offsetx)
-  <- {"ok": true|false, "state": ..., "video": ..., "error"?: ...}   reply to sender
-  <- {"event": "state", "state": ..., "video": ...}                  broadcast on every change
-
-The network calls OnClipEnd(key) when a player shows its last frame.
-T_MID is looped manually (cue back to 0 on its last frame) so T_OUT can start
-exactly at the end of a cycle, where the frames match.
+  <- {"event": "state", "state": "T_IN", "scene": "a"}
+       on every change and on connect. scene is what Unity should show: load it when it
+       changes, play it once the state is T_OUT, ACTIVE or IDLE.
+  -> {"cmd": "ready", "scene": "a"}      Unity has loaded and reset the scene (ends T_MID)
+  -> {"cmd": "request", "scene": "a"}    ask for a scene: a|b from IDLE, idle from ACTIVE
+  -> {"cmd": "cancel"}                   hard cut to IDLE
+  -> {"cmd": "state"}                    ask for the current state
+  -> {"cmd": "config", "values": {"debug": true}}
+                                         startup settings. Each key sets the media_server
+                                         custom par of the same name, capitalized (debug -> Debug)
+  <- {"ok": true|false, "state": ..., "scene": ..., "error"?: ...}   reply to every command
 """
 
 import json
-import TDFunctions as TDF
 
 IDLE, T_IN, T_MID, T_OUT, ACTIVE = 'IDLE', 'T_IN', 'T_MID', 'T_OUT', 'ACTIVE'
-TO_ACTIVE, TO_IDLE = 'to_active', 'to_idle'
-
-VIDEOS = ('a', 'b')
-
-# player key -> slot null inside this COMP.
-# Wire a moviefileinTOP into each slot null (directly, or through ops on input 0
-# such as switch_debug); the extension controls that movie (play / cue) and
-# info_<key> watches it.
-SLOTS = {
-	'idle': 'null_idle',
-	'a': 'null_a',
-	'b': 'null_b',
-	'tin': 'null_tin',
-	'tmid': 'null_tmid',
-	'tout': 'null_tout',
-}
-LOOPING = ('idle',)  # everything else holds its last frame (T_MID is looped by cueing)
-BASE_INDEX = {'idle': 0, 'a': 1, 'b': 2}                 # switch_base inputs
-TRANS_INDEX = {None: 0, 'tin': 1, 'tmid': 2, 'tout': 3}  # switch_trans inputs (0 = transparent)
-
-BASE_SWITCH = 'switch_base'
-TRANS_SWITCH = 'switch_trans'
-DEBUG_SWITCH = 'switch_debug'
-WS_SERVER = 'webserver_ws'
-VARS = 'null_vars'  # variables CHOP: frameDelay = frames the content starts after T_OUT
+CONTENT = ('a', 'b')
+BASES = ('idle', 'a', 'b')  # switch_base inputs
+SEG_TMID, SEG_TOUT = 1, 2  # timer_trans segments (rows of table_trans)
 
 
 class MediaServerExt:
-	"""State machine: idle loop -> transition -> content -> transition -> idle loop."""
 
 	def __init__(self, ownerComp):
 		self.ownerComp = ownerComp
 
-		TDF.createProperty(self, 'State', value=IDLE, dependable=True, readOnly=False)
-		TDF.createProperty(self, 'Video', value='', dependable=True, readOnly=False)
-
-		self.direction = None        # TO_ACTIVE | TO_IDLE while transitioning
-		self.releasePending = False  # release received, waiting for end of T_MID cycle
-		self.returnAt = None         # content index that starts the return (ACTIVE only)
-		self.stopPending = False     # stop received during T_OUT, return once ACTIVE
-		self.contentToken = 0        # bumped on IDLE, so a delayed content start that's no longer wanted is dropped
-		self.Config = {}             # last values received through the config cmd
+		self.State = IDLE
+		self.Scene = 'idle'       # what Unity should show
+		self.Base = 'idle'        # what's under the transition (constant_state base -> switch_base)
+		self.ready = False        # Unity has loaded Scene
+		self.stopPending = False  # idle requested during T_OUT on the way in
 
 		# re-init (file edit / reinitextensions) wipes state, so resync the network
-		run("args[0]._enterIdle()", self, delayFrames=1)
+		run("args[0].Cancel()", self, delayFrames=1)
 
-	# ------------------------------------------------------------------ commands
+	#region COMMANDS
 
-	def Play(self, video):
-		video = str(video).lower()
-		if video not in VIDEOS:
-			return self._result(False, 'unknown video: {}'.format(video))
-		if self.State != IDLE:
-			return self._result(False, 'busy')
-
-		self.Video = video
-		self.direction = TO_ACTIVE
-		self.releasePending = False
-		self._cue(video, play=False)  # hold content on frame 0, still hidden
-		self._enter(T_IN)
+	def Request(self, scene):
+		scene = str(scene).lower()
+		if scene in CONTENT:
+			if self.State != IDLE:
+				return self._result(False, 'busy')
+			self._setContent(scene)
+			self._transitionTo(scene)
+		elif scene == 'idle':
+			if self.State == ACTIVE:
+				self._transitionTo('idle')
+			elif self.State == T_OUT and self.Scene != 'idle':
+				self.stopPending = True
+			else:
+				return self._result(False, 'not playing content')
+		else:
+			return self._result(False, 'unknown scene: {}'.format(scene))
 		return self._result(True)
 
-	def Release(self):
-		if self.direction is not None and self.State in (T_IN, T_MID):
-			self.releasePending = True
-			return self._result(True)
-		return self._result(False, 'not waiting for release')
-
-	def Stop(self):
-		"""Return to IDLE with a transition, without waiting for the content to end."""
-		if self.State == ACTIVE:
-			self._beginReturn()
-			return self._result(True)
-		if self.State == T_OUT and self.direction == TO_ACTIVE:
-			self.stopPending = True
-			return self._result(True)
-		return self._result(False, 'not active')
+	def Ready(self, scene):
+		if self.State not in (T_IN, T_MID) or str(scene).lower() != self.Scene:
+			return self._result(False, 'not waiting for {}'.format(scene))
+		self.ready = True
+		timer = self.ownerComp.op('timer_trans')
+		if self.State == T_IN:
+			timer.goTo(segment=SEG_TOUT, endOfCycle=True)  # skip T_MID
+		else:
+			timer.lastCycle()  # finish this T_MID loop, then T_OUT
+		return self._result(True)
 
 	def Cancel(self):
-		self._enterIdle()
+		self._updateLengths()
+		self.ownerComp.op('timer_trans').par.initialize.pulse()
+		self.ownerComp.op('timer_content').par.initialize.pulse()
+		self.ready = False
+		self.stopPending = False
+		self.Scene = 'idle'
+		self._setBase('idle', force=True)
+		self._enter(IDLE)
 		return self._result(True)
 
-	def Reset(self):
-		return self.Cancel()
-
 	def Configure(self, values):
-		"""Apply startup settings from a client. Each key sets the custom par with the
-		same name, capitalized (debug -> Debug). Keys without a par are kept in Config
-		and reported once."""
 		if not isinstance(values, dict):
 			return self._result(False, 'config values must be an object')
-
-		self.Config.update(values)
-		missing = []
 		for key, value in values.items():
 			par = getattr(self.ownerComp.par, str(key).capitalize(), None)
 			if par is None:
-				missing.append(key)
+				debug('MediaServer: no custom par for config key', key)
 				continue
 			par.val = value
-
-		if 'debug' in values:
-			self._setDebug(values['debug'])
-
-		if missing:
-			debug('MediaServer: no custom par for config keys', missing)
 		return self._result(True)
-
-	# ------------------------------------------------------------------ events
-
-	def OnClipEnd(self, key):
-		"""Called by the network when player `key` shows its last frame."""
-		s = self.State
-
-		if key == 'tin' and s == T_IN:
-			self._enter(T_OUT if self._released() else T_MID)
-
-		elif key == 'tmid' and s == T_MID:
-			if self._released():
-				self._enter(T_OUT)
-			else:
-				self._cue('tmid', play=True)  # loop another cycle
-
-		elif key == 'tout' and s == T_OUT:
-			if self.direction == TO_ACTIVE:
-				self._enter(ACTIVE)
-			else:
-				self._enterIdle(restart=False)  # idle already running underneath
-
-		elif s == ACTIVE and key == self.Video:
-			# backup only: normally the return starts early via OnFrameEnd
-			self._beginReturn()
-
-	def OnFrameEnd(self):
-		"""Called every frame. Starts the return early, so the content's last
-		frame lands under T_IN's last (fully opaque) frame."""
-		if self.State != ACTIVE or self.returnAt is None:
-			return
-		p = self._player(self.Video)
-		if p is not None and p.index >= self.returnAt:
-			self._beginReturn()
-
-	def _beginReturn(self):
-		self.direction = TO_IDLE
-		self.returnAt = None
-		self._enter(T_IN)  # content keeps playing under the transition
-
-	def _computeReturnAt(self):
-		"""Content index at which T_IN must start, or None if unknown.
-
-		T_IN starts the frame after the trigger, so with T_IN length L and
-		content length N, triggering at index N-1-L puts both last frames on
-		the same displayed frame. Returntrim (frames) shifts it: + = earlier.
-		"""
-		content, tin = self._player(self.Video), self._player('tin')
-		if content is None or tin is None:
-			return None
-		n, l = content.numImages, tin.numImages
-		if n <= 0 or l <= 0:
-			return None
-		if abs(content.rate - tin.rate) > 0.01:
-			debug('MediaServer: video {} is {} fps but T_IN is {} fps - return timing will be off'
-				.format(self.Video, content.rate, tin.rate))
-		trim = int(self.ownerComp.par.Returntrim.eval())
-		return max(0, n - 1 - l - trim)
-
-	def SkipClip(self):
-		"""Debug: pretend the clip the current state is waiting on just ended."""
-		key = {T_IN: 'tin', T_MID: 'tmid', T_OUT: 'tout', ACTIVE: self.Video}.get(self.State)
-		if key:
-			self.OnClipEnd(key)
-		return self._result(bool(key), None if key else 'nothing to skip in IDLE')
 
 	def onParPulse(self, par):
 		if par.name == 'Initpulse':
-			self.Reset()
+			self.Cancel()
 
-	# ------------------------------------------------------------------ websocket
+	#endregion
+
+	#region TIMER EVENTS
+
+	# timer_trans entered a segment (timer_trans_callbacks)
+	def OnTransSegment(self, segment):
+		if self.State not in (T_IN, T_MID):
+			return
+		if segment == SEG_TMID:
+			self._setBase(self.Scene)  # screen fully covered: swap what's underneath
+			self._enter(T_MID)
+			if self.ready or not self._hasClients():
+				self.ownerComp.op('timer_trans').lastCycle()
+		elif segment == SEG_TOUT:
+			self._setBase(self.Scene)  # only does something when T_MID was skipped
+			self._enter(T_OUT)
+			if self.Scene in CONTENT:
+				self.ownerComp.op('timer_content').par.start.pulse()
+
+	# timer_trans finished T_OUT
+	def OnTransDone(self):
+		if self.State != T_OUT:
+			return
+		if self.Scene == 'idle':
+			self._enter(IDLE)
+			return
+		self._enter(ACTIVE)
+		if self.stopPending:
+			self.stopPending = False
+			self._transitionTo('idle')
+
+	# timer_content is T_IN's length from its end
+	def OnContentEnding(self):
+		if self.State == ACTIVE:
+			self._transitionTo('idle')
+
+	#endregion
+
+	#region WEBSOCKET
 
 	def OnClientConnect(self, client):
-		self._send(client, self._result(True))  # tell the new client where we are
+		self._send(client, self._stateMessage())
 
 	def OnClientDisconnect(self, client):
 		pass
@@ -233,12 +164,10 @@ class MediaServerExt:
 		except Exception:
 			result = self._result(False, 'invalid json')
 		else:
-			if cmd == 'play':
-				result = self.Play(msg.get('video', ''))
-			elif cmd == 'stop':
-				result = self.Stop()
-			elif cmd == 'release':
-				result = self.Release()
+			if cmd == 'request':
+				result = self.Request(msg.get('scene', ''))
+			elif cmd == 'ready':
+				result = self.Ready(msg.get('scene', ''))
 			elif cmd == 'cancel':
 				result = self.Cancel()
 			elif cmd == 'state':
@@ -252,183 +181,64 @@ class MediaServerExt:
 			self._send(client, result)
 		return result
 
-	# ------------------------------------------------------------------ internals
+	#endregion
+
+	#region INTERNALS
+
+	def _transitionTo(self, scene):
+		self.Scene = scene
+		self.ready = False
+		self._enter(T_IN)
+		self.ownerComp.op('timer_trans').par.start.pulse()
 
 	def _enter(self, state):
-		prev = self.State
 		self.State = state
+		self.ownerComp.par.State = state
+		self.ownerComp.par.Scene = self.Scene
+		for client in self.ownerComp.op('webserver_ws').webSocketConnections:
+			self._send(client, self._stateMessage())
 
-		if state == T_IN:
-			self._cue('tmid', play=False)
-			self._cue('tout', play=False)
-			self._cue('tin', play=True)
-			self._showTrans('tin')
-
-		elif state == T_MID:
-			self._cue('tmid', play=True)
-			self._showTrans('tmid')
-			self._stop('tin')
-			self._swapBase()
-
-		elif state == T_OUT:
-			if prev == T_IN:  # T_MID skipped: the swap happens here instead
-				self._stop('tin')
-				self._swapBase()
-			self.releasePending = False
-			self._cue('tout', play=True)
-			self._showTrans('tout')
-			self._stop('tmid')
-			if self.direction == TO_ACTIVE:
-				self._startContent()  # content starts with the reveal (+ frameDelay)
-
-		elif state == ACTIVE:
-			self._showTrans(None)
-			self._stop('tout')
-			self.returnAt = self._computeReturnAt()
-
-		self._broadcastState()
-
-		if state == ACTIVE and self.stopPending:
-			self.stopPending = False
-			self._beginReturn()
-
-	def _startContent(self):
-		"""Plays the content video, frameDelay frames (null_vars) after T_OUT starts."""
-		frames = self._frameDelay()
-		if frames <= 0:
-			self._play(self.Video)
+	def _setBase(self, scene, force=False):
+		if scene == self.Base and not force:
 			return
-		run("args[0]._startContentNow(args[1], args[2])",
-			self, self.Video, self.contentToken, delayFrames=frames)
-
-	def _startContentNow(self, video, token):
-		# Skip if TD went back to IDLE (cancel) or moved on to another video meanwhile.
-		if token == self.contentToken and video == self.Video and self.direction == TO_ACTIVE:
-			self._play(video)
-
-	def _frameDelay(self):
-		chop = self.ownerComp.op(VARS)
-		chan = chop['frameDelay'] if chop is not None else None
-		return max(0, int(round(chan.eval()))) if chan is not None else 0
-
-	def _swapBase(self):
-		"""Screen is fully covered (end of T_IN): swap what's underneath."""
-		if self.direction == TO_ACTIVE:
-			self._setBase(self.Video)  # paused on frame 0
-			self._stop('idle')
+		if scene == 'idle':
+			self.ownerComp.op('idle_loop').par.cuepulse.pulse()  # idle restarts from its first frame
 		else:
-			self._cue('idle', play=True)
-			self._setBase('idle')
-			self._stop(self.Video)
+			self.ownerComp.op('timer_content').par.initialize.pulse()  # content waits on frame 0
+		self.Base = scene
+		self.ownerComp.op('constant_state').par.value0 = BASES.index(scene)  # switch_base
 
-	def _released(self):
-		"""May the transition move on to T_OUT? With no client connected nobody can
-		send release, so don't wait for one."""
-		return self.releasePending or not self._hasClients()
+	# Copies the transition movie lengths into table_trans (timer_trans segments). Plain numbers,
+	# so the running timer doesn't make the info CHOPs decode every movie each frame.
+	def _updateLengths(self):
+		table = self.ownerComp.op('table_trans')
+		for row, info in (('tin', 'info_tin'), ('tmid', 'info_tmid'), ('tout', 'info_tout')):
+			table[row, 'length'] = int(self.ownerComp.op(info)['true_length'])
+
+	# Picks the content video of this run and copies its length for timer_content.
+	def _setContent(self, scene):
+		info = self.ownerComp.op('info_content')
+		info.par.op = 'active_' + scene
+		state = self.ownerComp.op('constant_state').par
+		state.value1 = CONTENT.index(scene)
+		state.value2 = int(info['true_length'])
 
 	def _hasClients(self):
-		ws = self.ownerComp.op(WS_SERVER)
-		return ws is not None and len(ws.webSocketConnections) > 0
-
-	def _enterIdle(self, restart=True):
-		if restart:
-			self.ConfigurePlayers()
-		self.direction = None
-		self.releasePending = False
-		self.returnAt = None
-		self.stopPending = False
-		self.contentToken += 1
-		for key in ('a', 'b', 'tin', 'tmid', 'tout'):
-			self._stop(key)
-		self._showTrans(None)
-		if restart:
-			self._cue('idle', play=True)
-		self._setBase('idle')
-		self.Video = ''
-		self.State = IDLE
-		self._broadcastState()
-
-	# players / switches (safe when ops don't exist yet)
-
-	def _player(self, key):
-		"""The moviefileinTOP feeding the slot null, or None. Follows first inputs
-		upstream, so a switch in between (e.g. switch_debug before null_idle) is fine."""
-		node = self.ownerComp.op(SLOTS.get(key, ''))
-		for _ in range(8):
-			if node is None or not node.inputs:
-				return None
-			node = node.inputs[0]
-			if node.OPType == 'moviefileinTOP':
-				return node
-		return None
-
-	def ConfigurePlayers(self):
-		"""Put every connected movie into the mode the state machine expects."""
-		found = {}
-		for key in SLOTS:
-			p = self._player(key)
-			found[key] = p.path if p else None
-			if p is None:
-				continue
-			p.par.playmode = 'sequential'
-			p.par.textendright = 'cycle' if key in LOOPING else 'hold'
-		return found
-
-	def _cue(self, key, play):
-		p = self._player(key)
-		if p is None:
-			return
-		p.par.cuepoint = 0
-		p.par.cuepulse.pulse()
-		p.par.play = play
-
-	def _play(self, key):
-		p = self._player(key)
-		if p is not None:
-			p.par.play = True
-
-	def _stop(self, key):
-		p = self._player(key)
-		if p is not None:
-			p.par.play = False
-
-	def _setBase(self, key):
-		sw = self.ownerComp.op(BASE_SWITCH)
-		if sw is not None:
-			sw.par.index = BASE_INDEX[key]
-
-	def _showTrans(self, key):
-		sw = self.ownerComp.op(TRANS_SWITCH)
-		if sw is not None:
-			sw.par.index = TRANS_INDEX[key]
-
-	def _setDebug(self, on):
-		"""switch_debug: 0 = normal, 1 = debug."""
-		sw = self.ownerComp.op(DEBUG_SWITCH)
-		if sw is not None:
-			sw.par.index = 1 if on else 0
-
-	# messaging
+		return len(self.ownerComp.op('webserver_ws').webSocketConnections) > 0
 
 	def _result(self, ok, error=None):
-		r = {'ok': ok, 'state': self.State, 'video': self.Video}
+		r = {'ok': ok, 'state': self.State, 'scene': self.Scene}
 		if error:
 			r['error'] = error
 		return r
 
-	def _broadcastState(self):
-		msg = {'event': 'state', 'state': self.State, 'video': self.Video}
-		ws = self.ownerComp.op(WS_SERVER)
-		if ws is None:
-			return
-		for client in ws.webSocketConnections:
-			self._send(client, msg)
+	def _stateMessage(self):
+		return {'event': 'state', 'state': self.State, 'scene': self.Scene}
 
 	def _send(self, client, payload):
-		ws = self.ownerComp.op(WS_SERVER)
-		if ws is None:
-			return
 		try:
-			ws.webSocketSendText(client, json.dumps(payload))
+			self.ownerComp.op('webserver_ws').webSocketSendText(client, json.dumps(payload))
 		except Exception as e:
 			debug('MediaServer send failed:', client, e)
+
+	#endregion

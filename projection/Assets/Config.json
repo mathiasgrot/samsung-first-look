@@ -1,0 +1,8 @@
+{
+    "useDebug": false,
+    "isMaster": true,
+    "idleDuration": 15,
+    "latencyFrames": 2,
+    "serverAddress": "127.0.0.1",
+    "serverPort": 9980
+}

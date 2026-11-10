@@ -1,5 +1,5 @@
 {
-    "sensorSizeX": 15,
+    "cropFactor": 15,
     "shiftX": 0,
     "shiftY": -0.06
 }

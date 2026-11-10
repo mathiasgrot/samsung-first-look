@@ -4,28 +4,21 @@ using System.Collections;
 using System.IO;
 using System;
 
-/// <summary>
-/// AppManager and its children survive scene loads; everything else is replaced.
-/// A scene that contains another AppManager (e.g. reloading the first scene) gets its copy
-/// removed, children included.
-/// </summary>
-
 [Serializable]
 public class RendererConfig 
 {
     public int targetFrameRate = 60;
     public bool useVSync = false;
     public bool useDebug = false;
-    public string serverUrl = "ws://127.0.0.1:9980";  // TD machine's webserver_ws (MediaServer's Port parameter)
-    public int ndiLatencyFrames = 0;                  // scenes start this many frames ahead to make up for the NDI delay to TD
+    public string serverUrl = "ws://127.0.0.1:9980";
+    public int ndiLatencyFrames = 0;
 }
 
-// Per-venue camera alignment (StagingConfig.json), applied by StagingCamera.
 [Serializable]
 public class StagingConfig
 {
-    public float sensorSizeX = 10f;  // physical camera sensor width (mm); the height stays as set on the camera
-    public float shiftX = 0f;        // lens shift, in fractions of the sensor size
+    public float cropFactor = 10f;
+    public float shiftX = 0f;
     public float shiftY = -0.06f;
 }
 
@@ -36,6 +29,7 @@ public class AppManager : MonoBehaviour
     public static AppManager Instance { get; private set; }
 
     public RendererConfig config = new RendererConfig();
+    public bool SettingsLoaded { get; private set; }  // Config.json and StagingConfig.json have been read
     public StagingConfig staging = new StagingConfig();
 
     public GameObject debugGrid;
@@ -78,20 +72,10 @@ public class AppManager : MonoBehaviour
 
         if (ctrl && shift)
         {
-            if (Input.GetKeyDown(KeyCode.R))
-                ReloadScene();
-            else if (Input.GetKeyDown(KeyCode.Q))
-                QuitApp();
+            if (Input.GetKeyDown(KeyCode.R)) ReloadScene();
+            else if (Input.GetKeyDown(KeyCode.Q)) QuitApp();
             return;
         }
-
-        // Scene keys: 1 = A, 2 = B, 3 = back to Idle (top row or numpad)
-        if (Input.GetKeyDown(KeyCode.Alpha1) || Input.GetKeyDown(KeyCode.Keypad1))
-            LoadA();
-        else if (Input.GetKeyDown(KeyCode.Alpha2) || Input.GetKeyDown(KeyCode.Keypad2))
-            LoadB();
-        else if (Input.GetKeyDown(KeyCode.Alpha3) || Input.GetKeyDown(KeyCode.Keypad3))
-            LoadIdle();
     }
 
     #endregion
@@ -100,6 +84,7 @@ public class AppManager : MonoBehaviour
     {
         string basePath = Application.streamingAssetsPath;
 
+        // config
         yield return LoadJson(
             Path.Combine(basePath, "Config.json"),
             json =>
@@ -108,6 +93,7 @@ public class AppManager : MonoBehaviour
             }
         );
 
+        // staging
         yield return LoadJson(
             Path.Combine(basePath, "StagingConfig.json"),
             json =>
@@ -124,10 +110,9 @@ public class AppManager : MonoBehaviour
 
     void Initialize()
     {
+        SettingsLoaded = true;
         if (Application.isPlaying) ApplyFrameRate();
 
-        // useDebug reaches TouchDesigner through TouchDesignerBridge's config message,
-        // which is sent every time the bridge connects.
         if (config.useDebug)
         {
             debugGrid.SetActive(true);
@@ -148,40 +133,6 @@ public class AppManager : MonoBehaviour
 
     #region SCENES
 
-    public void LoadA()
-    {
-        if (SceneLoader.Instance != null && TdCanPlay())
-            SceneLoader.Instance.LoadA();
-    }
-
-    public void LoadB()
-    {
-        if (SceneLoader.Instance != null && TdCanPlay())
-            SceneLoader.Instance.LoadB();
-    }
-
-    // TD only accepts play in IDLE; starting A/B otherwise would leave TD behind.
-    private bool TdCanPlay()
-    {
-        TouchDesignerBridge bridge = TouchDesignerBridge.Instance;
-        if (bridge == null || bridge.CanPlay)
-            return true;
-
-        Debug.Log($"[AppManager] TD is {bridge.State}, not IDLE: ignoring scene request.");
-        return false;
-    }
-
-    // Transitions back to Idle (TouchDesignerBridge tells TD to return too).
-    public void LoadIdle()
-    {
-        if (SceneLoader.Instance != null)
-            SceneLoader.Instance.LoadIdle();
-    }
-
-    /// <summary>
-    /// Full restart: reloads the first scene and destroys this AppManager, so the scene's own
-    /// AppManager starts fresh. The new TouchDesignerBridge brings TD back to IDLE when it connects.
-    /// </summary>
     public void ReloadScene()
     {
         // A sync load can't run while SceneLoader's background load is waiting for activation.
@@ -192,7 +143,6 @@ public class AppManager : MonoBehaviour
         Destroy(gameObject);
     }
 
-    
     public void QuitApp()
     {
         #if UNITY_EDITOR

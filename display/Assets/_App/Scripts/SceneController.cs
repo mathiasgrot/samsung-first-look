@@ -4,14 +4,12 @@ using UnityEngine.SceneManagement;
 using UnityEngine.Video;
 
 /// <summary>
-/// One per scene: owns what the scene plays (a video for now, later maybe a timeline).
+/// One per scene: owns what the scene plays
 ///
 /// SceneLoader calls ResetScene() as soon as the scene is loaded, waits until IsReady,
 /// then calls Play() when it's told to (TD entering T_OUT, through TouchDesignerBridge).
-///
-/// Unity's picture reaches TD a few frames late over NDI, so the scene starts
-/// ndiLatencyFrames (Config.json) in, which puts it level with TD's own video.
 /// </summary>
+
 public class SceneController : MonoBehaviour
 {
     #region VARIABLES
@@ -89,7 +87,7 @@ public class SceneController : MonoBehaviour
         if (cameraSettingApplied) return;
 
         StagingConfig staging = AppManager.Instance.staging;
-        displayCamera.sensorSize = new Vector2(staging.sensorSizeX, displayCamera.sensorSize.y);
+        displayCamera.sensorSize = new Vector2(staging.cropFactor, displayCamera.sensorSize.y);
         displayCamera.lensShift = new Vector2(staging.shiftX, staging.shiftY);
 
         cameraSettingApplied = true;

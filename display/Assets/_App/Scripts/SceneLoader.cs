@@ -11,12 +11,14 @@ using UnityEngine.SceneManagement;
 ///   "in" -> loop state (screen covered) -> swap scene -> reset scene, wait until ready
 ///   -> SceneLoaded -> wait for PlayScene() -> play scene + "out"
 ///
-/// TouchDesignerBridge calls PlayScene() when TD enters T_OUT (or right away if TD isn't waiting).
+/// TouchDesignerBridge decides what loads and when it plays (TD owns the show).
+/// PlayScene() may come early: it's kept until the loaded scene is ready.
 ///
 /// The new scene loads in the background while "in" plays and replaces the old one additively,
 /// which avoids the hitch of a Single load (UnloadUnusedAssets + GC in one frame).
-/// Requests made mid-transition are ignored, like TouchDesigner's media server.
+/// A request made mid-transition loads once the current transition has finished.
 /// </summary>
+
 public class SceneLoader : MonoBehaviour
 {
     #region VARIABLES
@@ -40,6 +42,7 @@ public class SceneLoader : MonoBehaviour
     private static readonly int OutTrigger = Animator.StringToHash("out");
 
     public string CurrentScene { get; private set; }
+    public string TargetScene => pendingScene ?? loadingScene ?? CurrentScene;  // where the loader ends up
     public bool IsTransitioning { get; private set; }
     public bool IsLoading { get; private set; }  // true from the start of a transition until SceneLoaded
 
@@ -47,14 +50,13 @@ public class SceneLoader : MonoBehaviour
     public string AScene => aScene;
     public string BScene => bScene;
 
-    private bool playRequested;  // PlayScene() was called for the scene being loaded
+    private bool playRequested;   // PlayScene() was called for the scene being loaded
+    private string loadingScene;  // scene of the running transition
+    private string pendingScene;  // requested mid-transition, loads after it
 
     #endregion
 
     #region EVENTS
-
-    // Fired when a transition starts, with the scene it's going to.
-    public event Action<string> TransitionStarted;
 
     // Fired once the new scene is reset and ready (screen still covered). It plays on PlayScene().
     public event Action<string> SceneLoaded;
@@ -91,24 +93,33 @@ public class SceneLoader : MonoBehaviour
 
     #endregion
 
-    #region LOADING
+    #region DEBUGGING
 
-    public void LoadIdle() => LoadScene(idleScene);
-    public void LoadA() => LoadScene(aScene);
-    public void LoadB() => LoadScene(bScene);
-
-    // Transitions to a scene. Does nothing if it's already loaded.
-    public void LoadScene(string _sceneName)
+    void Update()
     {
-        if (_sceneName == CurrentScene) return;
-
-        // always load idle scene
-        if(_sceneName == idleScene) StartTransition(_sceneName);
-        // always load from idle scene
-        else if(CurrentScene == idleScene) StartTransition(_sceneName);
+        
+        if (Input.GetKeyDown(KeyCode.Alpha1))  LoadA();
+        else if (Input.GetKeyDown(KeyCode.Alpha2)) LoadB();
+        else if (Input.GetKeyDown(KeyCode.Alpha3)) LoadIdle();
     }
 
-    public void ReloadCurrentScene() => StartTransition(CurrentScene);
+    public void LoadA() => TouchDesignerBridge.Instance.RequestScene(SceneLoader.Instance.AScene);
+    public void LoadB() => TouchDesignerBridge.Instance.RequestScene(SceneLoader.Instance.BScene);
+    public void LoadIdle() => TouchDesignerBridge.Instance.RequestScene(SceneLoader.Instance.IdleScene);
+
+    #endregion
+
+
+    #region LOADING
+
+    // Transitions to a scene. Does nothing if the loader already ends up there.
+    public void LoadScene(string _sceneName)
+    {
+        if (_sceneName == TargetScene) return;
+
+        if (IsTransitioning) pendingScene = _sceneName;
+        else StartTransition(_sceneName);
+    }
 
     // Starts the loaded scene and the "out" animation. Called by TouchDesignerBridge.
     public void PlayScene() => playRequested = true;
@@ -119,12 +130,6 @@ public class SceneLoader : MonoBehaviour
 
     private void StartTransition(string _sceneName)
     {
-        if (IsTransitioning)
-        {
-            Debug.Log($"[SceneLoader] Transition running, ignoring request for '{_sceneName}'.", this);
-            return;
-        }
-
         if (!Application.CanStreamedLevelBeLoaded(_sceneName))
         {
             Debug.LogError($"[SceneLoader] Scene '{_sceneName}' can't be loaded. Is it in Build Settings?", this);
@@ -138,7 +143,8 @@ public class SceneLoader : MonoBehaviour
     {
         IsTransitioning = true;
         IsLoading = true;
-        TransitionStarted?.Invoke(_sceneName);
+        loadingScene = _sceneName;
+        playRequested = false;
 
         // Load in the background while "in" covers the screen.
         Scene oldScene = SceneManager.GetActiveScene();
@@ -157,11 +163,10 @@ public class SceneLoader : MonoBehaviour
         
         CurrentScene = _sceneName;
 
-        // Reset the new scene, then wait to be told to play (TD entering T_OUT).
+        // Reset the new scene, then wait to be told to play (TD revealing it).
         SceneController controller = SceneController.InScene(newScene);
         yield return ResetScene(controller);
-        
-        playRequested = false;
+
         IsLoading = false;
         SceneLoaded?.Invoke(_sceneName);
         yield return WaitFor(() => playRequested, "PlayScene()");
@@ -171,7 +176,16 @@ public class SceneLoader : MonoBehaviour
         transitionAnimator.SetTrigger(OutTrigger);
         yield return WaitFor(() => InState(idleStateName), $"animator state '{idleStateName}'");
 
+        loadingScene = null;
         IsTransitioning = false;
+
+        // A request that came in meanwhile.
+        if (pendingScene != null)
+        {
+            string next = pendingScene;
+            pendingScene = null;
+            LoadScene(next);
+        }
     }
 
     #endregion
