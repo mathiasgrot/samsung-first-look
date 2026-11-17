@@ -66,15 +66,12 @@ public class TouchDesignerBridge : MonoBehaviour
     private bool TdWaiting => State == TIn || State == TMid;  // TD holds its transition until we're ready
     private bool readySent;  // ready already sent for the transition TD is holding
 
-    #endregion
-
-    #region EVENTS
-
+    // Events
     public event Action<string, string> StateChanged; // (state, scene), fired whenever TD reports a different one
     public event Action<string> CommandFailed; // TD's error text when it rejects a command
-
+    
     #endregion
-
+    
     #region LIFECYCLE
 
     void Awake()

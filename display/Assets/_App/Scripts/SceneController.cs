@@ -41,11 +41,10 @@ public class SceneController : MonoBehaviour
 
     #region SCENE
 
-    // Cameras aligned, video back to the start frame, paused, and getting ready to play.
     public void ResetScene()
     {
         ApplyCameraSettings();
-
+        
         IsReady = false;
         video.Stop();
         video.prepareCompleted -= OnPrepared;
@@ -97,7 +96,7 @@ public class SceneController : MonoBehaviour
 
     #endregion
 
-    #region VIDEO EVENTS
+    #region PLAYBACKEVENTS
 
     private void OnPrepared(VideoPlayer _player)
     {

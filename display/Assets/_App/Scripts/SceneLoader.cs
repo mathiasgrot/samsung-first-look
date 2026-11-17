@@ -25,18 +25,16 @@ public class SceneLoader : MonoBehaviour
 
     public static SceneLoader Instance { get; private set; }
 
-    [SerializeField] private string idleScene = "Idle";
-    [SerializeField] private string aScene = "A";
-    [SerializeField] private string bScene = "B";
+    public string idleScene = "Idle";
+    public string aScene = "A";
+    public string bScene = "B";
 
     [Header("Transition")]
-    [SerializeField] private Animator transitionAnimator;
-    [Tooltip("Looping state the animator sits in while the screen is covered.")]
-    [SerializeField] private string loopStateName = "loop";
-    [Tooltip("State the animator returns to after 'out' has finished.")]
-    [SerializeField] private string idleStateName = "idle";
+    public Animator transitionAnimator;
+    public string loopStateName = "loop";
+    public string idleStateName = "idle"; // State the animator returns to after 'out' has finished.
     [Tooltip("Max seconds to wait for each step (animator state, scene ready, PlayScene) before moving on anyway.")]
-    [SerializeField] private float timeout = 15f;
+    public float timeout = 15f;
 
     private static readonly int InTrigger = Animator.StringToHash("in");
     private static readonly int OutTrigger = Animator.StringToHash("out");
@@ -54,14 +52,11 @@ public class SceneLoader : MonoBehaviour
     private string loadingScene;  // scene of the running transition
     private string pendingScene;  // requested mid-transition, loads after it
 
-    #endregion
-
-    #region EVENTS
-
-    // Fired once the new scene is reset and ready (screen still covered). It plays on PlayScene().
+    // Events
     public event Action<string> SceneLoaded;
 
     #endregion
+
 
     #region LIFECYCLE
 
@@ -162,7 +157,6 @@ public class SceneLoader : MonoBehaviour
         yield return SceneManager.UnloadSceneAsync(oldScene);
         
         CurrentScene = _sceneName;
-
         // Reset the new scene, then wait to be told to play (TD revealing it).
         SceneController controller = SceneController.InScene(newScene);
         yield return ResetScene(controller);
@@ -171,8 +165,7 @@ public class SceneLoader : MonoBehaviour
         SceneLoaded?.Invoke(_sceneName);
         yield return WaitFor(() => playRequested, "PlayScene()");
 
-        if (controller != null)
-            controller.Play();
+        if (controller != null) controller.Play();
         transitionAnimator.SetTrigger(OutTrigger);
         yield return WaitFor(() => InState(idleStateName), $"animator state '{idleStateName}'");
 

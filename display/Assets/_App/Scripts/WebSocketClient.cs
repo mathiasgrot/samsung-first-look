@@ -26,15 +26,12 @@ public class WebSocketClient : MonoBehaviour
     private ClientWebSocket socket;
     private CancellationTokenSource cts;
     private readonly SemaphoreSlim sendLock = new SemaphoreSlim(1, 1);
-
-    #endregion
-
-    #region EVENTS
-
+    
+    // Events
     public event Action Connected;
     public event Action Disconnected;  // only after a connection that was open, not on failed attempts
     public event Action<string> MessageReceived;
-
+    
     #endregion
 
     #region LIFECYCLE
